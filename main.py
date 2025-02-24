@@ -2,7 +2,7 @@ import pdf2image
 from PIL import ImageChops
 import io
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from PIL import Image, ImageChops, ImageDraw
 import numpy as np
 from imagehash import average_hash
@@ -10,6 +10,7 @@ import os
 import uuid
 from typing import List, Dict
 from pydantic import BaseModel
+import asyncio
 
 app = FastAPI()
 
@@ -56,72 +57,97 @@ def convert_pdf_to_images(pdf_data):
     pdf_stream = io.BytesIO(pdf_data)
     return pdf2image.convert_from_bytes(pdf_stream.getvalue())
 
+# Constants for optimization
+MAX_PDF_SIZE = 5 * 1024 * 1024  # 5MB
+MAX_PAGES = 10
+DPI = 150  # Lower DPI for faster processing
+
+async def process_pdf_chunk(pdf_content, start_page, end_page):
+    try:
+        images = pdf2image.convert_from_bytes(
+            pdf_content,
+            first_page=start_page,
+            last_page=end_page,
+            dpi=DPI
+        )
+        return images
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error processing PDF: {str(e)}")
+
 @app.post("/compare-pdfs")
 async def compare_pdfs(
-    pdf1: UploadFile = File(..., description="First PDF file"),
-    pdf2: UploadFile = File(..., description="Second PDF file")
+    pdf1: UploadFile = File(...),
+    pdf2: UploadFile = File(...),
 ):
-    if not pdf1.content_type == "application/pdf" or not pdf2.content_type == "application/pdf":
-        raise HTTPException(status_code=400, detail="Both files must be PDFs")
+    # Validate file sizes
+    if (await pdf1.read(MAX_PDF_SIZE + 1)) > MAX_PDF_SIZE:
+        raise HTTPException(status_code=400, detail="PDF 1 is too large (max 5MB)")
+    if (await pdf2.read(MAX_PDF_SIZE + 1)) > MAX_PDF_SIZE:
+        raise HTTPException(status_code=400, detail="PDF 2 is too large (max 5MB)")
+    
+    # Reset file positions
+    await pdf1.seek(0)
+    await pdf2.seek(0)
     
     try:
-        # Create unique directory for this comparison
         comparison_id = str(uuid.uuid4())
         comparison_dir = os.path.join(TEMP_DIR, comparison_id)
         os.makedirs(comparison_dir, exist_ok=True)
         
-        # Read PDF files directly from uploads
+        # Read files
         pdf1_content = await pdf1.read()
         pdf2_content = await pdf2.read()
         
-        # Convert PDFs to images
-        images1 = pdf2image.convert_from_bytes(pdf1_content)
-        images2 = pdf2image.convert_from_bytes(pdf2_content)
+        # Get number of pages
+        images1 = await process_pdf_chunk(pdf1_content, 1, 1)
+        images2 = await process_pdf_chunk(pdf2_content, 1, 1)
         
-        if len(images1) != len(images2):
-            return {"error": "PDFs have different number of pages"}
+        if len(images1) > MAX_PAGES or len(images2) > MAX_PAGES:
+            raise HTTPException(status_code=400, detail=f"PDFs must not exceed {MAX_PAGES} pages")
         
         results = []
-        for i in range(len(images1)):
-            if not are_images_similar(images1[i], images2[i]):
-                results.append({
-                    "page": i + 1,
-                    "error": "Pages are too different to compare"
-                })
-                continue
+        # Process pages in chunks of 2
+        for i in range(0, len(images1), 2):
+            chunk_end = min(i + 2, len(images1))
             
-            boxes, diff_percentage = find_differences(images1[i], images2[i])
+            # Process chunks concurrently
+            tasks = [
+                process_pdf_chunk(pdf1_content, i + 1, chunk_end),
+                process_pdf_chunk(pdf2_content, i + 1, chunk_end)
+            ]
+            chunk_images1, chunk_images2 = await asyncio.gather(*tasks)
             
-            if boxes is None:
-                results.append({
-                    "page": i + 1,
-                    "message": "No differences found",
-                    "difference_percentage": 0
-                })
-                continue
-            
-            # Draw rectangles around differences
-            img1_marked = images1[i].copy()
-            img2_marked = images2[i].copy()
-            draw1 = ImageDraw.Draw(img1_marked)
-            draw2 = ImageDraw.Draw(img2_marked)
-            
-            for box in boxes:
-                draw1.rectangle(box, outline="red", width=2)
-                draw2.rectangle(box, outline="red", width=2)
-            
-            # Save marked images as files
-            img1_path = os.path.join(comparison_dir, f"page_{i+1}_doc1.png")
-            img2_path = os.path.join(comparison_dir, f"page_{i+1}_doc2.png")
-            img1_marked.save(img1_path)
-            img2_marked.save(img2_path)
-            
-            results.append({
-                "page": i + 1,
-                "difference_percentage": round(diff_percentage, 2),
-                "image1_url": f"/images/{comparison_id}/page_{i+1}_doc1.png",
-                "image2_url": f"/images/{comparison_id}/page_{i+1}_doc2.png"
-            })
+            for j, (img1, img2) in enumerate(zip(chunk_images1, chunk_images2)):
+                page_num = i + j + 1
+                
+                # Resize images for faster processing
+                img1 = img1.resize((int(img1.width/2), int(img1.height/2)))
+                img2 = img2.resize((int(img2.width/2), int(img2.height/2)))
+                
+                if not are_images_similar(img1, img2):
+                    results.append({
+                        "page": page_num,
+                        "error": "Pages too different"
+                    })
+                    continue
+                
+                boxes, diff_percentage = find_differences(img1, img2)
+                
+                if boxes:
+                    # Save only pages with differences
+                    img1_path = os.path.join(comparison_dir, f"page_{page_num}_doc1.png")
+                    img2_path = os.path.join(comparison_dir, f"page_{page_num}_doc2.png")
+                    
+                    # Optimize image saving
+                    img1.save(img1_path, "PNG", optimize=True)
+                    img2.save(img2_path, "PNG", optimize=True)
+                    
+                    results.append({
+                        "page": page_num,
+                        "difference_percentage": round(diff_percentage, 2),
+                        "image1_url": f"/images/{comparison_id}/page_{page_num}_doc1.png",
+                        "image2_url": f"/images/{comparison_id}/page_{page_num}_doc2.png"
+                    })
         
         return {"comparison_id": comparison_id, "results": results}
         
